@@ -605,10 +605,11 @@ def main():
         test_frames = CHUNK_SIZE
         test_int16_mv = memoryview(b'\x00\x00' * test_frames)
         # Use a transient callback that collects bytes count only (no playback)
-        def _nop_write(b): pass
+        def _nop_write(b):
+            pass
         status, nbytes = client.post_waveform_stream(test_int16_mv, test_frames, tx_write_callback=_nop_write)
-    if DEBUG:
-        print("Connection test -> status:", status, "resp bytes:", nbytes)
+        if DEBUG:
+            print("Connection test -> status:", status, "resp bytes:", nbytes)
     except Exception as e:
         print("Connection test failed:", e)
 
