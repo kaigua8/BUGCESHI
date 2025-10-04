@@ -25,6 +25,8 @@ except Exception:
     I2S = None
 
 # ---- CONFIG ----
+# 关闭/打开调试日志
+DEBUG = False
 API_URL = "http://192.168.31.90:18000/api/voice-changer/convert_chunk_bulk"
 SSID = "Xiaomi_5662"
 PASSWORD = "fafafa888"
@@ -48,7 +50,7 @@ SPK_SD_PIN  = 7
 # ----------------
 
 # 是否用本地 WAV 文件替代 I2S 采集进行测试
-USE_WAV_FILE = True
+USE_WAV_FILE = False
 WAV_PATH = "src/456.wav"
 
 def _read_wav_info(f):
@@ -172,10 +174,12 @@ class HTTPKeepAliveClient:
             s.connect((self.host, self.port))
             self.sock = s
             self._closed_by_server = False
-            print("HTTP keep-alive: connected to", (self.host, self.port))
+            if DEBUG:
+                print("HTTP keep-alive: connected to", (self.host, self.port))
             return True
         except Exception as e:
-            print("HTTP connect failed:", e)
+            if DEBUG:
+                print("HTTP connect failed:", e)
             self.sock = None
             return False
 
@@ -186,6 +190,22 @@ class HTTPKeepAliveClient:
             except Exception:
                 pass
         self.sock = None
+
+    def _recv_line(self, maxlen=4096):
+        # 读取直到 CRLF，返回不包含 CRLF 的行字节
+        data = b""
+        while True:
+            b = self.sock.recv(1)
+            if not b:
+                raise OSError("socket closed while reading line")
+            if b == b"\n":
+                # 去掉末尾的 '\r'（如有）
+                if data.endswith(b"\r"):
+                    return data[:-1]
+                return data
+            data += b
+            if len(data) > maxlen:
+                raise OSError("line too long")
 
     def _recv_until(self, delim=b"\r\n\r\n", maxhdr=8192):
         # read until header end, return header bytes
@@ -270,13 +290,15 @@ class HTTPKeepAliveClient:
                 hdr_s = hdr.decode('utf-8', 'ignore')
             except:
                 hdr_s = str(hdr)
-            # print response header (helpful debugging)
-            print("=== HTTP Resp Header ===")
-            print(hdr_s)
+            if DEBUG:
+                # print response header (helpful debugging)
+                print("=== HTTP Resp Header ===")
+                print(hdr_s)
 
             # parse status and content-length and connection header
             status_code = 0
             content_len = None
+            transfer_chunked = False
             connection_header = ""
             for ln in hdr_s.split("\r\n"):
                 if ln.startswith("HTTP/"):
@@ -293,12 +315,14 @@ class HTTPKeepAliveClient:
                             content_len = int(v.strip())
                         except:
                             content_len = None
+                    if k.lower().strip() == "transfer-encoding" and "chunked" in v.lower():
+                        transfer_chunked = True
                     if k.lower().strip() == "connection":
                         connection_header = v.strip().lower()
 
             # Read response body, stream-process float32 -> int16 and call tx callback with pcm chunks
             bytes_read = 0
-            if content_len is not None:
+            if content_len is not None and not transfer_chunked:
                 to_read = content_len
                 buf = b""
                 # read fixed amount
@@ -329,9 +353,67 @@ class HTTPKeepAliveClient:
                                 except Exception:
                                     pass
                             pos += sub_proc_len
+                        if (bytes_read & 0x1FFF) == 0:
+                            gc.collect()
                         # keep remainder
                         buf = buf[proc_len:]
                 # finished reading
+            elif transfer_chunked:
+                # RFC 7230 chunked transfer encoding
+                buf = b""
+                while True:
+                    # read chunk-size line
+                    line = self._recv_line()
+                    if not line:
+                        # empty line between chunks may appear; read again
+                        continue
+                    try:
+                        size = int(line.decode('utf-8').split(";", 1)[0], 16)
+                    except Exception:
+                        size = 0
+                    if size == 0:
+                        # read trailing CRLF (possibly trailer headers)
+                        # absorb until empty line
+                        # many servers send just one blank line
+                        try:
+                            _ = self._recv_line()
+                        except Exception:
+                            pass
+                        break
+                    remaining = size
+                    while remaining > 0:
+                        chunk = self.sock.recv(min(1024, remaining))
+                        if not chunk:
+                            self._closed_by_server = True
+                            remaining = 0
+                            break
+                        bytes_read += len(chunk)
+                        remaining -= len(chunk)
+                        buf += chunk
+                        proc_len = (len(buf) // 4) * 4
+                        if proc_len > 0:
+                            pos = 0
+                            max_proc = 512 * 4
+                            while pos < proc_len:
+                                sub_proc_len = min(max_proc, proc_len - pos)
+                                fsub = buf[pos: pos + sub_proc_len]
+                                pcm_len = len(fsub) // 2
+                                pcm = bytearray(pcm_len)
+                                float32_to_int16_into(fsub, pcm)
+                                if tx_write_callback:
+                                    try:
+                                        tx_write_callback(pcm)
+                                    except Exception:
+                                        pass
+                                pos += sub_proc_len
+                            buf = buf[proc_len:]
+                        if (bytes_read & 0x1FFF) == 0:
+                            gc.collect()
+                    # each chunk is terminated by CRLF; consume it
+                    try:
+                        _ = self.sock.recv(2)
+                    except Exception:
+                        pass
             else:
                 # no content-length, read until close
                 buf = b""
@@ -359,6 +441,8 @@ class HTTPKeepAliveClient:
                                     pass
                             pos += sub_proc_len
                         buf = buf[proc_len:]
+                    if (bytes_read & 0x1FFF) == 0:
+                        gc.collect()
 
             # if server indicated Connection: close, then we must close our socket
             if connection_header == "close" or self._closed_by_server:
@@ -371,7 +455,8 @@ class HTTPKeepAliveClient:
             gc.collect()
             return status_code, bytes_read
         except Exception as e:
-            print("HTTP socket error while posting:", e)
+            if DEBUG:
+                print("HTTP socket error while posting:", e)
             # close socket to force reconnect next time
             try:
                 if self.sock:
@@ -396,7 +481,7 @@ def create_tx(rate, bits, channels):
         bits=bits,
         format=fmt,
         rate=rate,
-        ibuf=4 * 1024
+        ibuf=8 * 1024
     )
 
 def create_rx(rate, bits, channels):
@@ -412,7 +497,7 @@ def create_rx(rate, bits, channels):
         bits=bits,
         format=fmt,
         rate=rate,
-        ibuf=4 * 1024
+        ibuf=8 * 1024
     )
 
 # ---------- Server info helper (uses urequests if available) ----------
@@ -448,6 +533,41 @@ def get_server_chunk_sec(default_sec=DEFAULT_CHUNK_SEC):
         # print("get_server_chunk_sec error:", e)
         return default_sec
 
+# ---------- Helpers ----------
+def _i2s_read_exact(rx, target_buf):
+    # 尝试把 target_buf 填满，避免短读造成聚合错位
+    if rx is None:
+        return 0
+    mv = memoryview(target_buf)
+    total = 0
+    want = len(target_buf)
+    while total < want:
+        try:
+            n = rx.readinto(mv[total:])
+        except Exception:
+            n = 0
+        if not n:
+            time.sleep(0.001)
+            continue
+        total += n
+    return total
+
+def _i2s_write_silence(tx, frames, channels=1, chunk_frames=CHUNK_SIZE):
+    # 播放静音，维持节拍
+    if tx is None:
+        return
+    silence = b"\x00\x00" * (chunk_frames * channels)
+    remaining = frames
+    while remaining > 0:
+        step = chunk_frames if remaining >= chunk_frames else remaining
+        try:
+            tx.write(silence[:step * 2 * channels])
+        except Exception:
+            pass
+        remaining -= step
+        if (remaining & 0x3FF) == 0:
+            gc.collect()
+
 # ---------- Main real-time flow ----------
 def main():
     # WiFi
@@ -459,15 +579,14 @@ def main():
 
     # create I2S
     tx = create_tx(SAMPLE_RATE, BITS, CHANNELS)
+    rx = None if USE_WAV_FILE else create_rx(SAMPLE_RATE, BITS, CHANNELS)
 
     # compute aggregation to match server chunk_sec like test_voice_changer.py
     chunk_sec = get_server_chunk_sec(DEFAULT_CHUNK_SEC)
     required_frames = int(math.ceil(SAMPLE_RATE * chunk_sec))
-    agg_chunks_init = max(1, int(math.ceil(required_frames / CHUNK_SIZE)))
-    agg_chunks_cur = max(1, agg_chunks_init)
-    agg_chunks_init = 4
-    agg_chunks_cur = 4
-    print("Server chunk_sec:", chunk_sec, "agg_chunks_init:", agg_chunks_init)
+    agg_chunks_cur = max(1, int(math.ceil(required_frames / CHUNK_SIZE)))
+    if DEBUG:
+        print("Server chunk_sec:", chunk_sec, "agg_chunks:", agg_chunks_cur)
 
     # allocate aggregation buffer (int16)
     agg_frames = agg_chunks_cur * CHUNK_SIZE
@@ -488,39 +607,71 @@ def main():
         # Use a transient callback that collects bytes count only (no playback)
         def _nop_write(b): pass
         status, nbytes = client.post_waveform_stream(test_int16_mv, test_frames, tx_write_callback=_nop_write)
+    if DEBUG:
         print("Connection test -> status:", status, "resp bytes:", nbytes)
     except Exception as e:
         print("Connection test failed:", e)
 
-    # main loop: always read from WAV file, aggregate and send
+    # main loop: I2S mic or WAV file, aggregate and send
     try:
-        with open(WAV_PATH, "rb") as f:
-            ch, rate, bits, data_off, data_size = _read_wav_info(f)
-            print("WAV info:", ch, rate, bits, data_off, data_size)
-            if bits != 16:
-                print("Warning: WAV bits is not 16, current code expects 16-bit PCM")
-            if rate != SAMPLE_RATE:
-                print("Warning: WAV sample rate", rate, "!=", SAMPLE_RATE)
-            if ch != CHANNELS:
-                print("Warning: WAV channels", ch, "!=", CHANNELS)
-            f.seek(data_off)
-            # allocate buffer for reading from file
+        if USE_WAV_FILE:
+            with open(WAV_PATH, "rb") as f:
+                ch, rate, bits, data_off, data_size = _read_wav_info(f)
+                if DEBUG:
+                    print("WAV info:", ch, rate, bits, data_off, data_size)
+                if bits != 16 and DEBUG:
+                    print("Warning: WAV bits is not 16, current code expects 16-bit PCM")
+                if rate != SAMPLE_RATE and DEBUG:
+                    print("Warning: WAV sample rate", rate, "!=", SAMPLE_RATE)
+                if ch != CHANNELS and DEBUG:
+                    print("Warning: WAV channels", ch, "!=", CHANNELS)
+                f.seek(data_off)
+                mic_buf = bytearray(CHUNK_SIZE * (BITS // 8) * CHANNELS)
+                loop_count = 0
+                total_read = 0
+                while True:
+                    n = f.readinto(mic_buf)
+                    if n is None or n <= 0:
+                        break
+                    loop_count += 1
+                    total_read += n
+                    idx = ((loop_count - 1) % agg_chunks_cur) * len(mic_buf)
+                    agg_int16[idx: idx + len(mic_buf)] = mic_buf
+
+                    if (loop_count % agg_chunks_cur) == 0:
+                        cur_frames = agg_frames
+                        cur_mv = memoryview(agg_int16)[:cur_frames * 2 * CHANNELS]
+                        if DEBUG:
+                            print("Sending aggregated frames:", cur_frames, "bytes payload approx:", cur_frames * 4)
+                        def tx_write(pcm_bytes):
+                            if tx:
+                                try:
+                                    tx.write(pcm_bytes)
+                                except Exception:
+                                    pass
+                        status, nbytes = client.post_waveform_stream(cur_mv, cur_frames, tx_write_callback=tx_write)
+                        if (status is None) or (status != 200) or (nbytes == 0):
+                            _i2s_write_silence(tx, cur_frames, CHANNELS, CHUNK_SIZE)
+                        if DEBUG:
+                            print("post status:", status, "resp bytes:", nbytes)
+                        gc.collect()
+                if DEBUG:
+                    print("WAV streaming done, bytes read:", total_read)
+        else:
+            # I2S capture path
             mic_buf = bytearray(CHUNK_SIZE * (BITS // 8) * CHANNELS)
             loop_count = 0
-            total_read = 0
             while True:
-                n = f.readinto(mic_buf)
-                if n is None or n <= 0:
-                    break
+                n = _i2s_read_exact(rx, mic_buf)
+                if n <= 0:
+                    continue
                 loop_count += 1
-                total_read += n
                 idx = ((loop_count - 1) % agg_chunks_cur) * len(mic_buf)
                 agg_int16[idx: idx + len(mic_buf)] = mic_buf
 
                 if (loop_count % agg_chunks_cur) == 0:
                     cur_frames = agg_frames
                     cur_mv = memoryview(agg_int16)[:cur_frames * 2 * CHANNELS]
-                    print("Sending aggregated frames:", cur_frames, "bytes payload approx:", cur_frames * 4)
                     def tx_write(pcm_bytes):
                         if tx:
                             try:
@@ -528,13 +679,14 @@ def main():
                             except Exception:
                                 pass
                     status, nbytes = client.post_waveform_stream(cur_mv, cur_frames, tx_write_callback=tx_write)
-                    print("post status:", status, "resp bytes:", nbytes)
+                    if (status is None) or (status != 200) or (nbytes == 0):
+                        _i2s_write_silence(tx, cur_frames, CHANNELS, CHUNK_SIZE)
+                    if DEBUG:
+                        print("post status:", status, "resp bytes:", nbytes)
                     gc.collect()
-            print("WAV streaming done, bytes read:", total_read)
-    except Exception as e:
-        print("WAV streaming error:", e)
     except KeyboardInterrupt:
-        print("Exit by user")
+        if DEBUG:
+            print("Exit by user")
     except Exception as e:
         print("Runtime error:", e)
     finally:
@@ -542,6 +694,11 @@ def main():
         try:
             if tx:
                 tx.deinit()
+        except Exception:
+            pass
+        try:
+            if rx:
+                rx.deinit()
         except Exception:
             pass
 
